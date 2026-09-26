@@ -42,6 +42,25 @@ th[aria-sort="descending"] .sort-button::after {
     }
 }
 
+/* Clickable transaction rows: pointer cursor, hover tint, and a
+   visible keyboard focus ring. The .striped prefix keeps hover and
+   focus ahead of Pico's striped-row selector; this file loads after
+   Pico, so equal specificity still wins. */
+tbody tr {
+    cursor: pointer;
+}
+
+@media (hover: hover) and (pointer: fine) {
+    table.striped tbody tr:hover {
+        background: var(--pico-muted-border-color);
+    }
+}
+
+table.striped tbody tr:focus-visible {
+    outline: 2px solid var(--pico-primary);
+    outline-offset: -2px;
+}
+
 /* Pagination sits below the table but must not scroll with it,
    since the container is overflow-auto for wide tables. */
 .pagination {
@@ -88,4 +107,12 @@ th[aria-sort="descending"] .sort-button::after {
 
 #transaction-card-fields dd {
     margin: 0;
+}
+
+/* Stack the label above the value on narrow screens. */
+@media (max-width: 560px) {
+    #transaction-card-fields .field {
+        grid-template-columns: 1fr;
+        gap: 0.15rem;
+    }
 }

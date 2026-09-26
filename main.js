@@ -316,6 +316,7 @@ function createPagination(page, pageCount, total) {
     const prev = document.createElement("button");
     prev.type = "button";
     prev.className = "page-button";
+    prev.dataset.focusKey = "page:prev";
     prev.textContent = "Previous";
     prev.disabled = page <= 1;
     prev.addEventListener("click", () => goToPage(page - 1));
@@ -323,6 +324,7 @@ function createPagination(page, pageCount, total) {
     const next = document.createElement("button");
     next.type = "button";
     next.className = "page-button";
+    next.dataset.focusKey = "page:next";
     next.textContent = "Next";
     next.disabled = page >= pageCount;
     next.addEventListener("click", () => goToPage(page + 1));
@@ -356,6 +358,7 @@ function createHeaderCell(display) {
     button.type = "button";
     button.className = "sort-button";
     button.textContent = display.label;
+    button.dataset.focusKey = "sort:" + display.column;
     button.addEventListener("click", () => cycleSort(display.column));
 
     th.appendChild(button);
@@ -363,13 +366,11 @@ function createHeaderCell(display) {
 }
 
 function renderTable() {
-    // Re-rendering destroys the focused button, so remember which
-    // column had focus in order to restore it afterwards.
+    // Re-rendering destroys the focused control, so remember its
+    // data-focus-key in order to restore focus afterwards.
     const active = document.activeElement;
-    const focusedColumn =
-        active && active.className === "sort-button"
-            ? active.textContent
-            : null;
+    const focusedKey =
+        active && active.dataset ? active.dataset.focusKey || null : null;
 
     if (db === null) return;
 
@@ -408,8 +409,16 @@ function renderTable() {
             tr.appendChild(td);
         }
         // The row is the click target; the closure carries the full
-        // row data, so no lookup table is needed.
+        // row data, so no lookup table is needed. Rows are tabbable
+        // and open the card with Enter or Space, like a button.
         tr.addEventListener("click", () => openCard(row));
+        tr.tabIndex = 0;
+        tr.setAttribute("aria-haspopup", "dialog");
+        tr.addEventListener("keydown", (event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
+            openCard(row);
+        });
         tbody.appendChild(tr);
     }
     table.appendChild(tbody);
@@ -423,16 +432,11 @@ function renderTable() {
         );
     }
 
-    if (focusedColumn !== null) {
-        const buttons = tableContainer.querySelectorAll(
-            ".sort-button"
+    if (focusedKey !== null) {
+        const target = tableContainer.querySelector(
+            `[data-focus-key="${focusedKey}"]`
         );
-        for (const button of buttons) {
-            if (button.textContent === focusedColumn) {
-                button.focus();
-                break;
-            }
-        }
+        if (target !== null) target.focus();
     }
 }
 
