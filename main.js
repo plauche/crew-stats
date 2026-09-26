@@ -9,6 +9,7 @@ const tabButtons = [...document.querySelectorAll('[role="tab"]')];
 const tabPanels = [...document.querySelectorAll('[role="tabpanel"]')];
 const pocketSelect = document.getElementById("pocket-select");
 const pocketStatus = document.getElementById("pocket-status");
+const pocketTotal = document.getElementById("pocket-total");
 const pocketContainer = document.getElementById("pocket-container");
 const pocketChartFigure = document.getElementById("pocket-chart-figure");
 const pocketChartCaption = document.getElementById("pocket-chart-caption");
@@ -1019,6 +1020,10 @@ function hidePocketSummary() {
     pocketChartFigure.hidden = true;
     hidePocketStats();
     destroyPocketChart();
+    // Cleared as well as hidden so no previous pocket's number is
+    // left in the DOM, matching the statistics above.
+    pocketTotal.hidden = true;
+    pocketTotal.textContent = "";
     pocketSummaryKey = null;
 }
 
@@ -1054,6 +1059,36 @@ function renderPocketStats(spending) {
     pocketStats.hidden = false;
 }
 
+// The signed sum of every transaction filed under the selected
+// pocket: credits count positive, debits negative, and no date
+// window applies — unlike the chart, this is the pocket's all-time
+// total. SUM returns NULL for an empty set, and Number(NULL) is 0.
+function queryPocketTotal() {
+    const statement = db.prepare(
+        `SELECT SUM("Amount") AS "__total" FROM "Transaction" ` +
+            `WHERE "Pocket" = $pocket`,
+        { $pocket: pocketState.pocket }
+    );
+    try {
+        if (statement.step()) {
+            const value = statement.getAsObject()["__total"];
+            const total = Number(value);
+            return Number.isFinite(total) ? total : 0;
+        }
+    } finally {
+        statement.free();
+    }
+    return 0;
+}
+
+// The Total sits above the graph and shares its lifecycle: shown
+// when the summary for a pocket is built, cleared by
+// hidePocketSummary with everything else.
+function renderPocketTotal() {
+    pocketTotal.textContent = `Total: ${formatCurrency(queryPocketTotal())}`;
+    pocketTotal.hidden = false;
+}
+
 // The chart and the statistics are two views of one query and share a
 // lifecycle, so they are rendered together. Both are rebuilt only when
 // the selected pocket changed: paging re-renders the list but never
@@ -1073,6 +1108,8 @@ function renderPocketSummary() {
         hidePocketSummary();
         return;
     }
+
+    renderPocketTotal();
 
     const pocket = pocketState.pocket;
 
