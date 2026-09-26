@@ -69,10 +69,14 @@ const DISPLAY_COLUMNS = [
 // Columns shown in the Pockets tab, in display order. Same shape as
 // DISPLAY_COLUMNS so more fields can be added here alone; this view
 // is not sortable, so the column names are only used for lookup.
+// Note carries the pocket a row was moved out of (see
+// repairPocketLabels), so a pocket can be reviewed without opening
+// every row.
 const POCKET_COLUMNS = [
     { label: "Date", column: "Timestamp" },
     { label: "Title", column: "Title" },
     { label: "Amount", column: "Amount" },
+    { label: "Note", column: "Note" },
 ];
 
 // Paging happens in SQL (LIMIT/OFFSET) rather than in JS, so only
@@ -164,6 +168,51 @@ function normalizeRows(rows) {
         return out;
     });
     return { rows: normalized, unknown: [...unknown], collisions: [...collisions] };
+}
+
+// The export sometimes loses the pocket assignment on Autopilot
+// Reserve transfers: the Title names the funding pocket, but the row
+// is filed under a pocket that neither the Title nor the Memo
+// mentions. Such rows are parked in REVIEW_POCKET so the wrong pocket
+// is not silently inflated, and their original pocket is kept in Note
+// so the review queue still says where they belonged.
+//
+// Both comparisons are case-insensitive because the full export
+// spells the title "Autopilot reserve" as often as "Autopilot
+// Reserve". Note is only written here, never read, so importing the
+// same file again derives the same result.
+const AUTOPILOT_RESERVE_TITLE = "Autopilot Reserve";
+const REVIEW_POCKET = "Needs Attention";
+
+function repairPocketLabels(rows) {
+    let reassigned = 0;
+
+    const repaired = rows.map((row) => {
+        const title = (row.Title || "").toLowerCase();
+        if (!title.includes(AUTOPILOT_RESERVE_TITLE.toLowerCase())) {
+            return row;
+        }
+
+        const original = (row.Pocket || "").trim();
+        const haystack =
+            `${row.Title || ""}\n${row.Memo || ""}`.toLowerCase();
+        if (original !== "" && haystack.includes(original.toLowerCase())) {
+            return row;
+        }
+
+        reassigned += 1;
+        // A blank pocket records itself as such rather than leaving
+        // the reviewer to wonder whether the note was lost.
+        const label = `was: ${original === "" ? "(blank)" : original}`;
+        const note = (row.Note || "").trim();
+        return {
+            ...row,
+            Pocket: REVIEW_POCKET,
+            Note: note === "" ? label : `${note} · ${label}`,
+        };
+    });
+
+    return { rows: repaired, reassigned };
 }
 
 
@@ -1102,23 +1151,30 @@ fileInput.addEventListener("change", function (event) {
     Papa.parse(file, {
         header: true, // rows become objects keyed by the header row
         complete: async function (results) {
-            const { rows, unknown, collisions } = normalizeRows(
+            const { rows: fileRows, unknown, collisions } = normalizeRows(
                 Array.isArray(results.data) ? results.data : []
             );
 
             // Report columns present in the CSV that have no
             // schema counterpart, so nothing disappears quietly.
-            // An empty file has no data rows to compare against.
+            // An empty file has no data rows to compare against, and
+            // this describes the file, so it is read before the pocket
+            // repair writes a Note value the file may not have had.
             const missingColumns =
-                rows.length > 0
-                    ? COLUMN_NAMES.filter((name) => !(name in rows[0]))
+                fileRows.length > 0
+                    ? COLUMN_NAMES.filter((name) => !(name in fileRows[0]))
                     : [];
 
-            const badTimestamps = rows.filter(
+            const badTimestamps = fileRows.filter(
                 (row) =>
                     !isBlank(row.Timestamp) &&
                     toEpochMs(row.Timestamp) === null
             ).length;
+
+            // Repair the pocket labels before anything reads them: the
+            // table, the dropdown, the chart and the card all render
+            // the stored value.
+            const { rows, reassigned } = repairPocketLabels(fileRows);
 
             // A new file's headers may not match the old sort.
             sortState = { column: null, direction: "asc" };
@@ -1165,6 +1221,12 @@ fileInput.addEventListener("change", function (event) {
                     if (missingColumns.length > 0) {
                         notes.push(
                             `not in file: ${missingColumns.join(", ")}`
+                        );
+                    }
+                    if (reassigned > 0) {
+                        notes.push(
+                            `${reassigned} transaction(s) moved to ` +
+                                REVIEW_POCKET
                         );
                     }
                     statusEl.textContent =
