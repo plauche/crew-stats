@@ -1,0 +1,68 @@
+/* Let a header button fill its cell and sit flush with the th. */
+.sort-button {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+/* Unsortable-state affordance: a faint neutral arrow. */
+.sort-button::after {
+    content: "\2195"; /* up-down arrow */
+    opacity: 0.35;
+    font-size: 0.8em;
+}
+
+th[aria-sort="ascending"] .sort-button,
+th[aria-sort="descending"] .sort-button {
+    color: var(--pico-primary);
+}
+
+th[aria-sort="ascending"] .sort-button::after {
+    content: "\25B2"; /* up triangle */
+    opacity: 1;
+}
+
+th[aria-sort="descending"] .sort-button::after {
+    content: "\25BC"; /* down triangle */
+    opacity: 1;
+}
+
+@media (hover: hover) and (pointer: fine) {
+    .sort-button:hover {
+        background: var(--pico-muted-border-color);
+    }
+}
+
+/* Pagination sits below the table but must not scroll with it,
+   since the container is overflow-auto for wide tables. */
+.pagination {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.75rem;
+    position: sticky;
+    left: 0;
+}
+
+.pagination-label {
+    font-weight: 600;
+}
+
+.pagination-info {
+    margin-left: auto;
+    opacity: 0.7;
+}
+
+.page-button[disabled] {
+    opacity: 0.5;
+}
