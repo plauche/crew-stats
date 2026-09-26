@@ -1,6 +1,10 @@
 const fileInput = document.getElementById("csv-file-input");
 const statusEl = document.getElementById("status");
 const tableContainer = document.getElementById("table-container");
+const cardDialog = document.getElementById("transaction-card");
+const cardTitle = document.getElementById("transaction-card-title");
+const cardFields = document.getElementById("transaction-card-fields");
+const cardClose = document.getElementById("transaction-card-close");
 
 // Schema. "Transaction" is quoted because TRANSACTION is an SQLite
 // keyword. Timestamp is stored as epoch milliseconds so that
@@ -40,6 +44,16 @@ const COLUMN_LIST = COLUMN_NAMES.map((n) => `"${n}"`).join(", ");
 const TEXT_COLUMNS = new Set(
     COLUMNS.filter((c) => c.type === "TEXT").map((c) => c.name)
 );
+
+// Columns shown in the table, in display order, with their header
+// labels. Sorting still runs against the underlying schema column,
+// so "Date" sorts by Timestamp.
+const DISPLAY_COLUMNS = [
+    { label: "Date", column: "Timestamp" },
+    { label: "Title", column: "Title" },
+    { label: "Pocket", column: "Pocket" },
+    { label: "Amount", column: "Amount" },
+];
 
 // Paging happens in SQL (LIMIT/OFFSET) rather than in JS, so only
 // the visible page of rows is ever materialised. Every path that
@@ -158,6 +172,18 @@ function formatTimestamp(ms) {
     });
 }
 
+// Compact table date like "September 25". The year is left out of
+// the table on purpose; the detail card shows the full timestamp.
+function formatMonthDay(ms) {
+    if (isBlank(ms)) return "";
+    const date = new Date(Number(ms));
+    if (Number.isNaN(date.getTime())) return "";
+    return date.toLocaleDateString(undefined, {
+        month: "long",
+        day: "numeric",
+    });
+}
+
 // Cell value for storage: blank cells become NULL, and Timestamp is
 // coerced to epoch milliseconds.
 function toDbValue(name, value) {
@@ -165,9 +191,23 @@ function toDbValue(name, value) {
     return isBlank(value) ? null : value;
 }
 
-// Cell value for display: Timestamp is formatted as a local date.
+// USD currency for display: "$1,200.50". Non-numeric values fall
+// through unchanged so nothing disappears.
+function formatCurrency(value) {
+    if (isBlank(value)) return "";
+    const amount = Number(value);
+    if (Number.isNaN(amount)) return String(value);
+    return amount.toLocaleString(undefined, {
+        style: "currency",
+        currency: "USD",
+    });
+}
+
+// Cell value for display: Timestamp as a local date, Amount as USD
+// currency; blanks render empty.
 function formatCell(name, value) {
     if (name === "Timestamp") return formatTimestamp(value);
+    if (name === "Amount") return formatCurrency(value);
     return isBlank(value) ? "" : String(value);
 }
 
@@ -298,12 +338,12 @@ function createPagination(page, pageCount, total) {
     return nav;
 }
 
-function createHeaderCell(column) {
+function createHeaderCell(display) {
     const th = document.createElement("th");
     th.setAttribute("scope", "col");
     th.setAttribute(
         "aria-sort",
-        sortState.column === column
+        sortState.column === display.column
             ? sortState.direction === "asc"
                 ? "ascending"
                 : "descending"
@@ -315,8 +355,8 @@ function createHeaderCell(column) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "sort-button";
-    button.textContent = column;
-    button.addEventListener("click", () => cycleSort(column));
+    button.textContent = display.label;
+    button.addEventListener("click", () => cycleSort(display.column));
 
     th.appendChild(button);
     return th;
@@ -349,8 +389,8 @@ function renderTable() {
 
     const thead = document.createElement("thead");
     const headRow = document.createElement("tr");
-    for (const column of COLUMN_NAMES) {
-        headRow.appendChild(createHeaderCell(column));
+    for (const display of DISPLAY_COLUMNS) {
+        headRow.appendChild(createHeaderCell(display));
     }
     thead.appendChild(headRow);
     table.appendChild(thead);
@@ -358,11 +398,18 @@ function renderTable() {
     const tbody = document.createElement("tbody");
     for (const row of rows) {
         const tr = document.createElement("tr");
-        for (const name of COLUMN_NAMES) {
+        for (const display of DISPLAY_COLUMNS) {
             const td = document.createElement("td");
-            td.textContent = formatCell(name, row[name]);
+            const value = row[display.column];
+            td.textContent =
+                display.column === "Timestamp"
+                    ? formatMonthDay(value)
+                    : formatCell(display.column, value);
             tr.appendChild(td);
         }
+        // The row is the click target; the closure carries the full
+        // row data, so no lookup table is needed.
+        tr.addEventListener("click", () => openCard(row));
         tbody.appendChild(tr);
     }
     table.appendChild(tbody);
@@ -394,6 +441,54 @@ function showError(label, error) {
     tableContainer.replaceChildren();
     statusEl.textContent = `${label}: ${error.message}`;
 }
+
+// Human-friendly field heading: AccountLastFour -> "Account Last
+// Four". Timestamp is labelled "Date" to match the table header.
+function columnLabel(name) {
+    if (name === "Timestamp") return "Date";
+    return name.replace(/([a-z0-9])([A-Z])/g, "$1 $2");
+}
+
+// Opens the detail card for one transaction, listing every schema
+// field that actually holds a value in a vertical label/value flow.
+function openCard(row) {
+    cardTitle.textContent = isBlank(row.Title) ? "Transaction" : row.Title;
+    cardFields.replaceChildren();
+
+    for (const { name } of COLUMNS) {
+        const value = formatCell(name, row[name]);
+        if (value === "") continue;
+
+        const field = document.createElement("div");
+        field.className = "field";
+
+        const label = document.createElement("dt");
+        label.textContent = columnLabel(name);
+
+        const valueEl = document.createElement("dd");
+        valueEl.textContent = value;
+
+        field.appendChild(label);
+        field.appendChild(valueEl);
+        cardFields.appendChild(field);
+    }
+
+    // Pico's utility class stops the page scrolling behind the
+    // modal; the close event below removes it for every close path.
+    document.documentElement.classList.add("modal-is-open");
+    cardDialog.showModal();
+}
+
+// Close paths: the × button and clicking off the content (clicks
+// that land on the dialog itself, i.e. the backdrop). Escape closes
+// natively; the "close" event fires for all of them.
+cardClose.addEventListener("click", () => cardDialog.close());
+cardDialog.addEventListener("click", (event) => {
+    if (event.target === cardDialog) cardDialog.close();
+});
+cardDialog.addEventListener("close", () => {
+    document.documentElement.classList.remove("modal-is-open");
+});
 
 fileInput.addEventListener("change", function (event) {
     const file = event.target.files[0];

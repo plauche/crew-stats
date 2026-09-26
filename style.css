@@ -66,3 +66,26 @@ th[aria-sort="descending"] .sort-button::after {
 .page-button[disabled] {
     opacity: 0.5;
 }
+
+/* Transaction detail card: vertical label/value flow. */
+#transaction-card-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+#transaction-card-fields .field {
+    display: grid;
+    grid-template-columns: 10rem 1fr;
+    gap: 0.5rem;
+    align-items: baseline;
+}
+
+#transaction-card-fields dt {
+    font-weight: 600;
+    opacity: 0.7;
+}
+
+#transaction-card-fields dd {
+    margin: 0;
+}

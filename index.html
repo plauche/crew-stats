@@ -30,6 +30,23 @@
             <div id="table-container"></div>
         </main>
 
+        <dialog id="transaction-card" aria-labelledby="transaction-card-title">
+            <article>
+                <header>
+                    <button
+                        type="button"
+                        rel="prev"
+                        aria-label="Close"
+                        id="transaction-card-close"
+                    >
+                        ×
+                    </button>
+                    <p id="transaction-card-title"></p>
+                </header>
+                <dl id="transaction-card-fields"></dl>
+            </article>
+        </dialog>
+
         <script defer src="main.js"></script>
     </body>
 </html>
