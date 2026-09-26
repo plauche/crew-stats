@@ -943,14 +943,99 @@ function monthlySpendingWindow() {
     return { labels, buckets, startMs: start.getTime(), start };
 }
 
+// A base contribution's Title starts with the name of the pocket it
+// comes from: older exports write it bare ("Unallocated"), newer ones
+// follow it with an arrow and the destination ("Autopilot Reserve →
+// Eating out (Ryan)"); the arrow appears as "→" or "->" depending on
+// the export. Only the prefix is matched — the destination is not
+// re-checked against the selected pocket, since rows are already
+// filtered to it, and the export's spelling of the name may differ.
+// Case-insensitive, like the import filters.
+const BASE_CONTRIBUTION_RE =
+    /^(?:Autopilot Reserve|Autopilot|Unallocated)/i;
+
+// How close to a month boundary a contribution may post: one posted
+// within five days after a month's first day counts for that month,
+// and one within five days before the next month's first day (the
+// end of the previous month) counts for the following month.
+const BASE_CONTRIBUTION_WINDOW_MS = 5 * 24 * 60 * 60 * 1000;
+
+// Base contribution per charted month for the selected pocket,
+// aligned with window.buckets. The fetch starts five days before the
+// window so an end-of-previous-month post can still land on the
+// window's first month. Amounts are summed as recorded (signed).
+function queryBaseContributions(window) {
+    const contributions = window.buckets.map(() => 0);
+    const statement = db.prepare(
+        `SELECT "Timestamp", "Amount", "Title" FROM "Transaction" ` +
+            `WHERE "Pocket" = $pocket AND "Timestamp" IS NOT NULL ` +
+            `AND "Timestamp" >= $start`,
+        {
+            $pocket: pocketState.pocket,
+            $start: window.startMs - BASE_CONTRIBUTION_WINDOW_MS,
+        }
+    );
+    try {
+        while (statement.step()) {
+            const row = statement.getAsObject();
+            if (!BASE_CONTRIBUTION_RE.test((row.Title || "").trim())) {
+                continue;
+            }
+
+            const amount = Number(row.Amount);
+            if (Number.isNaN(amount)) continue;
+
+            const ms = Number(row.Timestamp);
+            const date = new Date(ms);
+            if (Number.isNaN(date.getTime())) continue;
+
+            // The month whose first day is within five days on
+            // either side is the month the contribution belongs to;
+            // mid-month dates match neither and are skipped.
+            const ownStart = new Date(
+                date.getFullYear(),
+                date.getMonth(),
+                1
+            ).getTime();
+            const nextStart = new Date(
+                date.getFullYear(),
+                date.getMonth() + 1,
+                1
+            ).getTime();
+
+            let target = null;
+            if (ms - ownStart <= BASE_CONTRIBUTION_WINDOW_MS) {
+                target = ownStart;
+            } else if (nextStart - ms <= BASE_CONTRIBUTION_WINDOW_MS) {
+                target = nextStart;
+            }
+            if (target === null) continue;
+
+            const targetDate = new Date(target);
+            const index = window.buckets.indexOf(
+                targetDate.getFullYear() * MONTHS_IN_WINDOW +
+                    targetDate.getMonth()
+            );
+            // Attributed past the anchor month: not charted.
+            if (index === -1) continue;
+            contributions[index] += amount;
+        }
+    } finally {
+        statement.free();
+    }
+    return contributions;
+}
+
 // Spending per month for the selected pocket: only outgoing amounts
 // count, so credits and refunds are ignored rather than netting a
-// month down, and every bar is positive.
+// month down, and every bar is positive. The base-contribution line
+// comes from queryBaseContributions and is bundled into the same
+// result so the chart and statistics keep one lifecycle.
 //
-// This is the one query that aggregates in JS instead of SQL. It reads
-// two columns for a single pocket over twelve months, and there is no
-// way to GROUP BY a *local* calendar month in this engine, so the
-// window is bucketed after the fetch rather than in the query.
+// Both aggregate in JS instead of SQL. It reads a few columns for a
+// single pocket over twelve months, and there is no way to GROUP BY
+// a *local* calendar month in this engine, so the window is bucketed
+// after the fetch rather than in the query.
 function queryMonthlySpending() {
     const window = monthlySpendingWindow();
     if (window === null || pocketState.pocket === null) return null;
@@ -986,6 +1071,7 @@ function queryMonthlySpending() {
     return {
         labels: window.labels,
         totals,
+        contributions: queryBaseContributions(window),
         first: window.labels[0],
         last: window.labels[MONTHS_IN_WINDOW - 1],
     };
@@ -1027,8 +1113,15 @@ function hidePocketSummary() {
     pocketSummaryKey = null;
 }
 
-function hasSpending(spending) {
-    return spending.totals.some((total) => total > 0);
+// The chart earns its place when either series has data: bars of
+// nothing say less than a sentence does, and an average over zero
+// months helps nobody. Contributions are summed signed, so any
+// non-zero value counts.
+function hasChartData(spending) {
+    return (
+        spending.totals.some((total) => total > 0) ||
+        spending.contributions.some((total) => total !== 0)
+    );
 }
 
 // Averages over the tail of the charted window: the last 3, 6 and 12
@@ -1113,10 +1206,10 @@ function renderPocketSummary() {
 
     const pocket = pocketState.pocket;
 
-    // A bar chart of nothing says less than a sentence does, and an
+    // A chart of nothing says less than a sentence does, and an
     // average over zero months helps nobody. The list below can still
     // be showing this pocket's older transactions.
-    if (!hasSpending(spending)) {
+    if (!hasChartData(spending)) {
         destroyPocketChart();
         pocketChartWrap.hidden = true;
         pocketChartFigure.hidden = false;
@@ -1151,13 +1244,22 @@ function drawPocketChart(spending, pocket) {
         if (spending.totals[i] > spending.totals[peak]) peak = i;
     }
 
+    // An all-zero line says nothing, so the dataset (and its
+    // mentions in the caption and text alternative) only appear when
+    // at least one month actually has a contribution.
+    const hasContributionLine = spending.contributions.some(
+        (total) => total !== 0
+    );
+
     // Free the canvas before a new instance claims it.
     destroyPocketChart();
 
     pocketChartWrap.hidden = false;
     pocketChartFigure.hidden = false;
     pocketChartCaption.textContent =
-        `Spending by month — ${pocket} · ${spending.first} – ${spending.last}`;
+        `Spending by month — ${pocket} · ` +
+        `${spending.first} – ${spending.last}` +
+        (hasContributionLine ? " · line: base contribution" : "");
     // The canvas renders as an image, so it carries its own text
     // alternative describing the shape of the data.
     pocketChartCanvas.setAttribute(
@@ -1165,30 +1267,56 @@ function drawPocketChart(spending, pocket) {
         `Bar chart of total spending per month for ${pocket}, ` +
             `${spending.first} to ${spending.last}. ` +
             `Highest month: ${spending.labels[peak]} at ` +
-            `${formatCurrency(spending.totals[peak])}.`
+            `${formatCurrency(spending.totals[peak])}.` +
+            (hasContributionLine
+                ? " The line shows the base contribution recorded " +
+                  "for each month."
+                : "")
     );
+
+    const datasets = [
+        {
+            type: "bar",
+            label: "Spending",
+            data: spending.totals,
+            backgroundColor: chartColor("--pico-primary", "#0172ad"),
+            borderRadius: 4,
+            order: 2,
+        },
+    ];
+    if (hasContributionLine) {
+        datasets.push({
+            type: "line",
+            label: "Base contribution",
+            data: spending.contributions,
+            borderColor: chartColor("--pico-success", "#26a269"),
+            backgroundColor: chartColor("--pico-success", "#26a269"),
+            borderWidth: 2,
+            pointRadius: 3,
+            tension: 0,
+            fill: false,
+            order: 1,
+        });
+    }
 
     pocketChart = new Chart(pocketChartCanvas, {
         type: "bar",
         data: {
             labels: spending.labels,
-            datasets: [
-                {
-                    label: "Spending",
-                    data: spending.totals,
-                    backgroundColor: chartColor("--pico-primary", "#0172ad"),
-                    borderRadius: 4,
-                },
-            ],
+            datasets,
         },
         options: {
             responsive: true,
             maintainAspectRatio: false,
             plugins: {
-                legend: { display: false },
+                // Two series need a key; the caption sits above the
+                // plot, so the legend goes below it.
+                legend: { display: true, position: "bottom" },
                 tooltip: {
                     callbacks: {
-                        label: (context) => formatCurrency(context.parsed.y),
+                        label: (context) =>
+                            `${context.dataset.label}: ` +
+                            `${formatCurrency(context.parsed.y)}`,
                     },
                 },
             },
