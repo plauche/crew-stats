@@ -37,24 +37,16 @@ function quote(name) {
 
 const COLUMN_LIST = COLUMN_NAMES.map((n) => `"${n}"`).join(", ");
 
-// Paging happens in SQL (LIMIT/OFFSET) rather than in JS, so only
-// the visible page of rows is ever materialised.
-const PAGE_SIZE = 10;
-let pageState = { page: 1 };
+const TEXT_COLUMNS = new Set(
+    COLUMNS.filter((c) => c.type === "TEXT").map((c) => c.name)
+);
 
-function countRows() {
-    const statement = db.prepare(
-        'SELECT COUNT(*) AS total FROM "Transaction"'
-    );
-    try {
-        // get() returns a positional array, so read the count via
-        // getAsObject() instead of get().total.
-        if (!statement.step()) return 0;
-        return Number(statement.getAsObject().total) || 0;
-    } finally {
-        statement.free();
-    }
-}
+// Paging happens in SQL (LIMIT/OFFSET) rather than in JS, so only
+// the visible page of rows is ever materialised. Every path that
+// shrinks the table (a new import) or re-orders it (a new sort) also
+// resets this to 1, so it is never left pointing past the end.
+const PAGE_SIZE = 10;
+let currentPage = 1;
 
 
 // CSV headers are matched to the schema case- and separator-
@@ -145,14 +137,10 @@ function isBlank(value) {
     return value === null || value === undefined || value === "";
 }
 
-// PapaParse's dynamicTyping only builds a Date for a full ISO
-// datetime with a timezone suffix, so Timestamp is coerced here.
-// Unparseable dates become NULL rather than sorting as 1970.
+// Unparseable dates become NULL rather than sorting as 1970. Values
+// arrive as strings because PapaParse's dynamicTyping is disabled.
 function toEpochMs(value) {
     if (isBlank(value)) return null;
-    if (value instanceof Date) {
-        return Number.isNaN(value.getTime()) ? null : value.getTime();
-    }
     const ms = Date.parse(value);
     return Number.isNaN(ms) ? null : ms;
 }
@@ -170,42 +158,38 @@ function formatTimestamp(ms) {
     });
 }
 
-function isTextColumn(name) {
-    const column = COLUMNS.find((entry) => entry.name === name);
-    return column ? column.type === "TEXT" : false;
+// Cell value for storage: blank cells become NULL, and Timestamp is
+// coerced to epoch milliseconds.
+function toDbValue(name, value) {
+    if (name === "Timestamp") return toEpochMs(value);
+    return isBlank(value) ? null : value;
+}
+
+// Cell value for display: Timestamp is formatted as a local date.
+function formatCell(name, value) {
+    if (name === "Timestamp") return formatTimestamp(value);
+    return isBlank(value) ? "" : String(value);
 }
 
 // Rows are inserted inside one transaction so a failed import can
 // never leave a half-loaded table behind.
 function loadRows(rows) {
     db.run("BEGIN TRANSACTION");
+    let statement = null;
     try {
-        db.run('DROP TABLE IF EXISTS "Transaction"');
-        db.run(SCHEMA);
+        // The table is created once at startup, so a re-import only
+        // needs to clear the previous rows.
+        db.run('DELETE FROM "Transaction"');
 
         const placeholders = COLUMN_NAMES.map(() => "?").join(", ");
-
-        for (let i = 0; i < rows.length; i += 500) {
-            const chunk = rows.slice(i, i + 500);
-            const values = [];
-            for (const row of chunk) {
-                for (const name of COLUMN_NAMES) {
-                    values.push(
-                        name === "Timestamp"
-                            ? toEpochMs(row[name])
-                            : isBlank(row[name])
-                              ? null
-                              : row[name]
-                    );
-                }
-            }
-            // Tuples must be comma-separated or the SQL is invalid.
-            const tuple = chunk
-                .map(() => "(" + placeholders + ")")
-                .join(", ");
-            db.run(
-                `INSERT INTO "Transaction" (${COLUMN_LIST}) VALUES ${tuple}`,
-                values
+        // One prepared statement reused for every row replaces the
+        // old hand-built multi-row tuple strings.
+        statement = db.prepare(
+            `INSERT INTO "Transaction" (${COLUMN_LIST}) VALUES (${placeholders})`
+        );
+        for (const row of rows) {
+            statement.run(
+                COLUMN_NAMES.map((name) => toDbValue(name, row[name]))
             );
         }
 
@@ -213,6 +197,8 @@ function loadRows(rows) {
     } catch (error) {
         db.run("ROLLBACK");
         throw error;
+    } finally {
+        if (statement !== null) statement.free();
     }
 }
 
@@ -222,19 +208,23 @@ function buildOrderBy() {
 
     const direction =
         sortState.direction === "asc" ? "ASC" : "DESC";
-    const collate = isTextColumn(sortState.column)
+    const collate = TEXT_COLUMNS.has(sortState.column)
         ? " COLLATE NOCASE"
         : "";
     return `${quote(sortState.column)}${collate} ${direction} NULLS LAST`;
 }
 
-function queryRows(limit, offset) {
+// Fetches the visible page of rows along with the full table size:
+// COUNT(*) OVER () is evaluated before LIMIT/OFFSET, so one query
+// replaces the old separate count + fetch.
+function queryPage() {
     // Named parameters only: sql.js cannot mix "?" placeholders
     // with a named-parameter object ("datatype mismatch").
     const statement = db.prepare(
-        `SELECT ${COLUMN_LIST} FROM "Transaction" ` +
+        `SELECT ${COLUMN_LIST}, COUNT(*) OVER () AS "__total" ` +
+            `FROM "Transaction" ` +
             `ORDER BY ${buildOrderBy()} LIMIT $limit OFFSET $offset`,
-        { $limit: limit, $offset: offset }
+        { $limit: PAGE_SIZE, $offset: (currentPage - 1) * PAGE_SIZE }
     );
     const rows = [];
     try {
@@ -242,16 +232,11 @@ function queryRows(limit, offset) {
     } finally {
         statement.free();
     }
-    return rows;
-}
-
-// Keeps the requested page inside the valid range, which matters
-// when a re-upload shrinks the table while the user is on page 3.
-function getPage(total) {
-    const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
-    const page = Math.min(Math.max(1, pageState.page), pageCount);
-    pageState.page = page;
-    return { page, pageCount };
+    // An empty result means an empty table: the page is reset to 1
+    // before any operation that could shrink the data, so an offset
+    // past the end cannot happen.
+    const total = rows.length > 0 ? Number(rows[0]["__total"]) : 0;
+    return { rows, total };
 }
 
 function cycleSort(column) {
@@ -265,12 +250,12 @@ function cycleSort(column) {
 
     // A new ordering can leave the current page empty, so start
     // again from the first page.
-    pageState.page = 1;
+    currentPage = 1;
     renderTable();
 }
 
 function goToPage(page) {
-    pageState.page = page;
+    currentPage = page;
     renderTable();
 }
 
@@ -348,9 +333,7 @@ function renderTable() {
 
     if (db === null) return;
 
-    const total = countRows();
-    const { page, pageCount } = getPage(total);
-    const rows = queryRows(PAGE_SIZE, (page - 1) * PAGE_SIZE);
+    const { rows, total } = queryPage();
 
     tableContainer.replaceChildren();
     tableContainer.className = "overflow-auto";
@@ -360,6 +343,7 @@ function renderTable() {
         return;
     }
 
+    const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
     const table = document.createElement("table");
     table.className = "striped";
 
@@ -376,13 +360,7 @@ function renderTable() {
         const tr = document.createElement("tr");
         for (const name of COLUMN_NAMES) {
             const td = document.createElement("td");
-            const value = row[name];
-            td.textContent =
-                name === "Timestamp"
-                    ? formatTimestamp(value)
-                    : isBlank(value)
-                      ? ""
-                      : String(value);
+            td.textContent = formatCell(name, row[name]);
             tr.appendChild(td);
         }
         tbody.appendChild(tr);
@@ -394,7 +372,7 @@ function renderTable() {
     // Only worth showing when the rows do not all fit on one page.
     if (pageCount > 1) {
         tableContainer.appendChild(
-            createPagination(page, pageCount, total)
+            createPagination(currentPage, pageCount, total)
         );
     }
 
@@ -411,6 +389,12 @@ function renderTable() {
     }
 }
 
+function showError(label, error) {
+    console.error(`${label}:`, error);
+    tableContainer.replaceChildren();
+    statusEl.textContent = `${label}: ${error.message}`;
+}
+
 fileInput.addEventListener("change", function (event) {
     const file = event.target.files[0];
 
@@ -418,25 +402,19 @@ fileInput.addEventListener("change", function (event) {
 
     // Pass the File object directly to Papa.parse
     Papa.parse(file, {
-        header: true, // Optional: turns rows into objects using the first row as headers
-        dynamicTyping: true, // Optional: auto-converts numbers and booleans
-        complete: function (results) {
-            console.log("Parsed data:", results.data);
-            console.log("Errors:", results.errors);
-
+        header: true, // rows become objects keyed by the header row
+        complete: async function (results) {
             const { rows, unknown, collisions } = normalizeRows(
                 Array.isArray(results.data) ? results.data : []
             );
 
             // Report columns present in the CSV that have no
             // schema counterpart, so nothing disappears quietly.
-            const missingColumns = COLUMN_NAMES.filter(
-                (name) =>
-                    !Object.prototype.hasOwnProperty.call(
-                        rows[0] || {},
-                        name
-                    )
-            );
+            // An empty file has no data rows to compare against.
+            const missingColumns =
+                rows.length > 0
+                    ? COLUMN_NAMES.filter((name) => !(name in rows[0]))
+                    : [];
 
             const badTimestamps = rows.filter(
                 (row) =>
@@ -446,59 +424,55 @@ fileInput.addEventListener("change", function (event) {
 
             // A new file's headers may not match the old sort.
             sortState = { column: null, direction: "asc" };
-            pageState.page = 1;
+            currentPage = 1;
 
-            // Wait for the WASM module before touching the database,
-            // in case a file is chosen before it has finished loading.
-            dbReady
-                .then(() => {
-                    loadRows(rows);
-                    renderTable();
+            try {
+                // Wait for the WASM module before touching the
+                // database, in case a file is chosen before it has
+                // finished loading.
+                await dbReady;
+                loadRows(rows);
+                renderTable();
 
-                    if (rows.length > 0) {
-                        const notes = [];
-                        if (results.errors.length > 0) {
-                            notes.push(
-                                `${results.errors.length} parse issue(s)`
-                            );
-                        }
-                        if (badTimestamps > 0) {
-                            notes.push(
-                                `${badTimestamps} unreadable timestamp(s)`
-                            );
-                        }
-                        if (unknown.length > 0) {
-                            notes.push(
-                                `ignored column(s): ${unknown.join(", ")}`
-                            );
-                        }
-                        if (collisions.length > 0) {
-                            notes.push(
-                                `duplicate mapping ignored: ${collisions.join(", ")}`
-                            );
-                        }
-                        if (missingColumns.length > 0) {
-                            notes.push(
-                                `not in file: ${missingColumns.join(", ")}`
-                            );
-                        }
-                        statusEl.textContent =
-                            `Stored ${rows.length} rows in the database.` +
-                            (notes.length > 0
-                                ? ` (${notes.join(", ")})`
-                                : "");
+                if (rows.length > 0) {
+                    const notes = [];
+                    if (results.errors.length > 0) {
+                        notes.push(
+                            `${results.errors.length} parse issue(s)`
+                        );
                     }
-                })
-                .catch((error) => {
-                    console.error("Import error:", error);
-                    tableContainer.replaceChildren();
-                    statusEl.textContent = `Import error: ${error.message}`;
-                });
+                    if (badTimestamps > 0) {
+                        notes.push(
+                            `${badTimestamps} unreadable timestamp(s)`
+                        );
+                    }
+                    if (unknown.length > 0) {
+                        notes.push(
+                            `ignored column(s): ${unknown.join(", ")}`
+                        );
+                    }
+                    if (collisions.length > 0) {
+                        notes.push(
+                            `duplicate mapping ignored: ${collisions.join(", ")}`
+                        );
+                    }
+                    if (missingColumns.length > 0) {
+                        notes.push(
+                            `not in file: ${missingColumns.join(", ")}`
+                        );
+                    }
+                    statusEl.textContent =
+                        `Stored ${rows.length} rows in the database.` +
+                        (notes.length > 0
+                            ? ` (${notes.join(", ")})`
+                            : "");
+                }
+            } catch (error) {
+                showError("Import error", error);
+            }
         },
         error: function (error) {
-            console.error("Parse error:", error);
-            tableContainer.replaceChildren();
-            statusEl.textContent = `Parse error: ${error.message}`;
+            showError("Parse error", error);
         },
     });
 });
