@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta name="color-scheme" content="light dark" />
+        <link
+            rel="stylesheet"
+            href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"
+        />
+        <script src="https://unpkg.com/papaparse@latest/papaparse.min.js"></script>
+
+        <title>Crew Stats</title>
+
+        <style>
+            /* Let a header button fill its cell and sit flush with the th. */
+            .sort-button {
+                display: flex;
+                align-items: center;
+                gap: 0.25rem;
+                width: 100%;
+                margin: 0;
+                padding: 0;
+                background: none;
+                border: none;
+                color: inherit;
+                font: inherit;
+                text-align: left;
+                cursor: pointer;
+            }
+
+            /* Unsortable-state affordance: a faint neutral arrow. */
+            .sort-button::after {
+                content: "\2195"; /* up-down arrow */
+                opacity: 0.35;
+                font-size: 0.8em;
+            }
+
+            th[aria-sort="ascending"] .sort-button,
+            th[aria-sort="descending"] .sort-button {
+                color: var(--pico-primary);
+            }
+
+            th[aria-sort="ascending"] .sort-button::after {
+                content: "\25B2"; /* up triangle */
+                opacity: 1;
+            }
+
+            th[aria-sort="descending"] .sort-button::after {
+                content: "\25BC"; /* down triangle */
+                opacity: 1;
+            }
+
+            @media (hover: hover) and (pointer: fine) {
+                .sort-button:hover {
+                    background: var(--pico-muted-border-color);
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <main class="container">
+            <h1>Hello world!</h1>
+            <input type="file" id="csv-file-input" accept=".csv,text/csv" />
+
+            <p id="status" role="status"></p>
+            <div id="table-container"></div>
+        </main>
+
+        <script>
+            const fileInput = document.getElementById("csv-file-input");
+            const statusEl = document.getElementById("status");
+            const tableContainer = document.getElementById("table-container");
+
+            // Canonical data, always kept in the original CSV order so that
+            // clearing the sort is just a matter of re-rendering.
+            let currentRows = [];
+            let currentColumns = [];
+            let sortState = { column: null, direction: "asc" };
+
+            // Collating by number means "9" sorts before "10" and mixed
+            // number/string columns order sensibly instead of yielding NaN.
+            const collator = new Intl.Collator(undefined, {
+                sensitivity: "base",
+                numeric: true,
+            });
+
+            function isBlank(value) {
+                return value === null || value === undefined || value === "";
+            }
+
+            function collectColumns(rows) {
+                const columns = [];
+                for (const row of rows) {
+                    for (const key of Object.keys(row)) {
+                        if (!columns.includes(key)) columns.push(key);
+                    }
+                }
+                return columns;
+            }
+
+            function getSortedRows() {
+                if (sortState.column === null) return currentRows;
+
+                const direction = sortState.direction === "desc" ? -1 : 1;
+
+                // Copy before sorting: sort() mutates, and currentRows must
+                // stay in CSV order. Array#sort is stable, so equal keys keep
+                // their original relative order.
+                // The direction multiplier must apply only to real values.
+                // Blanks are ranked separately so they stay at the bottom in
+                // BOTH directions instead of flipping to the top.
+                return [...currentRows].sort((rowA, rowB) => {
+                    const a = rowA[sortState.column];
+                    const b = rowB[sortState.column];
+                    const aBlank = isBlank(a);
+                    const bBlank = isBlank(b);
+
+                    if (aBlank || bBlank) {
+                        if (aBlank && bBlank) return 0;
+                        return aBlank ? 1 : -1;
+                    }
+
+                    return direction * collator.compare(a, b);
+                });
+            }
+
+            function cycleSort(column) {
+                if (sortState.column !== column) {
+                    sortState = { column, direction: "asc" };
+                } else if (sortState.direction === "asc") {
+                    sortState = { column, direction: "desc" };
+                } else {
+                    sortState = { column: null, direction: "asc" };
+                }
+
+                renderTable();
+            }
+
+            function createHeaderCell(column) {
+                const th = document.createElement("th");
+                th.setAttribute("scope", "col");
+                th.setAttribute(
+                    "aria-sort",
+                    sortState.column === column
+                        ? sortState.direction === "asc"
+                            ? "ascending"
+                            : "descending"
+                        : "none"
+                );
+
+                // A real <button> gives keyboard activation and a focus ring
+                // for free; the arrow is drawn by CSS so it is not announced.
+                const button = document.createElement("button");
+                button.type = "button";
+                button.className = "sort-button";
+                button.textContent = column;
+                button.addEventListener("click", () => cycleSort(column));
+
+                th.appendChild(button);
+                return th;
+            }
+
+            function renderTable() {
+                // Re-rendering destroys the focused button, so remember which
+                // column had focus in order to restore it afterwards.
+                const active = document.activeElement;
+                const focusedColumn =
+                    active && active.className === "sort-button"
+                        ? active.textContent
+                        : null;
+
+                tableContainer.replaceChildren();
+                tableContainer.className = "overflow-auto";
+
+                if (!Array.isArray(currentRows) || currentRows.length === 0) {
+                    statusEl.textContent = "No data found in file.";
+                    return;
+                }
+
+                const table = document.createElement("table");
+                table.className = "striped";
+
+                const thead = document.createElement("thead");
+                const headRow = document.createElement("tr");
+                for (const column of currentColumns) {
+                    headRow.appendChild(createHeaderCell(column));
+                }
+                thead.appendChild(headRow);
+                table.appendChild(thead);
+
+                const tbody = document.createElement("tbody");
+                for (const row of getSortedRows()) {
+                    const tr = document.createElement("tr");
+                    for (const column of currentColumns) {
+                        const td = document.createElement("td");
+                        const value = row[column];
+                        td.textContent = isBlank(value) ? "" : String(value);
+                        tr.appendChild(td);
+                    }
+                    tbody.appendChild(tr);
+                }
+                table.appendChild(tbody);
+
+                tableContainer.appendChild(table);
+
+                if (focusedColumn !== null) {
+                    const buttons = tableContainer.querySelectorAll(
+                        ".sort-button"
+                    );
+                    for (const button of buttons) {
+                        if (button.textContent === focusedColumn) {
+                            button.focus();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            fileInput.addEventListener("change", function (event) {
+                const file = event.target.files[0];
+
+                if (!file) return;
+
+                // Pass the File object directly to Papa.parse
+                Papa.parse(file, {
+                    header: true, // Optional: turns rows into objects using the first row as headers
+                    dynamicTyping: true, // Optional: auto-converts numbers and booleans
+                    complete: function (results) {
+                        console.log("Parsed data:", results.data);
+                        console.log("Errors:", results.errors);
+
+                        currentRows = Array.isArray(results.data)
+                            ? results.data
+                            : [];
+                        currentColumns = collectColumns(currentRows);
+
+                        // A new file's headers may not match the old sort.
+                        sortState = { column: null, direction: "asc" };
+
+                        renderTable();
+
+                        if (currentRows.length > 0) {
+                            statusEl.textContent =
+                                results.errors.length > 0
+                                    ? `Parsed ${currentRows.length} rows with ${
+                                          results.errors.length
+                                      } issue(s).`
+                                    : `Parsed ${currentRows.length} rows.`;
+                        }
+                    },
+                    error: function (error) {
+                        console.error("Parse error:", error);
+                        currentRows = [];
+                        currentColumns = [];
+                        sortState = { column: null, direction: "asc" };
+                        tableContainer.replaceChildren();
+                        statusEl.textContent = `Parse error: ${error.message}`;
+                    },
+                });
+            });
+        </script>
+    </body>
+</html>
