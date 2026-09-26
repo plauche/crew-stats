@@ -171,3 +171,28 @@ table.striped tbody tr:focus-visible {
     margin-bottom: 0.75rem;
 }
 
+/* Pocket spend chart. Chart.js sizes the canvas from its parent, so
+   the wrapper must be relatively positioned with an explicit height:
+   the chart is configured with maintainAspectRatio: false. */
+#pocket-chart-figure {
+    margin: 0 0 1rem;
+}
+
+/* Stated explicitly, like the tabpanels: figure and div both have a
+   display from the UA stylesheet, and the hidden attribute must win. */
+#pocket-chart-figure[hidden],
+#pocket-chart-wrap[hidden] {
+    display: none;
+}
+
+#pocket-chart-caption {
+    display: block;
+    margin-bottom: 0.5rem;
+    font-weight: 600;
+}
+
+#pocket-chart-wrap {
+    position: relative;
+    height: 260px;
+}
+

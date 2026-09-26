@@ -10,6 +10,10 @@ const tabPanels = [...document.querySelectorAll('[role="tabpanel"]')];
 const pocketSelect = document.getElementById("pocket-select");
 const pocketStatus = document.getElementById("pocket-status");
 const pocketContainer = document.getElementById("pocket-container");
+const pocketChartFigure = document.getElementById("pocket-chart-figure");
+const pocketChartCaption = document.getElementById("pocket-chart-caption");
+const pocketChartWrap = document.getElementById("pocket-chart-wrap");
+const pocketChartCanvas = document.getElementById("pocket-chart");
 
 // Schema. "Transaction" is quoted because TRANSACTION is an SQLite
 // keyword. Timestamp is stored as epoch milliseconds so that
@@ -80,6 +84,16 @@ let currentPage = 1;
 // changes or a new file is imported, so it is likewise never left
 // pointing past the end of the pocket's rows.
 let pocketState = { pocket: null, page: 1 };
+
+// The live Chart.js instance and the pocket it was built for, so
+// re-rendering the list while paging does not rebuild the chart.
+// destroyPocketChart() always resets both together.
+let pocketChart = null;
+let pocketChartKey = null;
+
+// How many monthly buckets the chart shows, ending with the most
+// recent month recorded across all pockets.
+const MONTHS_IN_WINDOW = 12;
 
 
 // CSV headers are matched to the schema case- and separator-
@@ -481,8 +495,14 @@ function selectTab(name) {
     }
 
     // The Pockets panel is re-rendered on entry so it can never show
-    // rows that a newer import has since replaced.
-    if (name === "pockets") renderPocket();
+    // rows that a newer import has since replaced, and the chart is
+    // torn down on the way out so the next one is built against the
+    // size the panel really has rather than a hidden canvas.
+    if (name === "pockets") {
+        renderPocket();
+    } else {
+        hidePocketChart();
+    }
 }
 
 function tabName(button) {
@@ -633,17 +653,20 @@ function renderPocket() {
 
     if (pocketSelect.disabled) {
         pocketStatus.textContent = "No pockets in this file.";
+        hidePocketChart();
         return;
     }
 
     if (pocketState.pocket === null) {
         pocketStatus.textContent = "Select a pocket to view its transactions.";
+        hidePocketChart();
         return;
     }
 
     const { rows, total } = queryPocketPage();
     if (total === 0) {
         pocketStatus.textContent = `No transactions in ${pocketState.pocket}.`;
+        hidePocketChart();
         return;
     }
 
@@ -709,6 +732,10 @@ function renderPocket() {
         );
         if (target !== null) target.focus();
     }
+
+    // Drawn last, once the list this chart describes is in place. A
+    // paging re-render leaves the existing instance alone.
+    renderPocketChart();
 }
 
 pocketSelect.addEventListener("change", () => {
@@ -717,6 +744,233 @@ pocketSelect.addEventListener("change", () => {
     pocketState = { pocket: value === "" ? null : value, page: 1 };
     renderPocket();
 });
+
+/* --------------------------- Pocket chart -------------------------- */
+
+// Chart.js loads from a CDN next to sql.js and PapaParse. If it is
+// blocked the table still works, so every entry point checks first.
+function chartAvailable() {
+    return typeof Chart !== "undefined";
+}
+
+// The window ends with the most recent month that has a usable
+// timestamp anywhere in the table (not just the selected pocket), so
+// every pocket is charted on the same absolute timeline. Buckets are
+// built from local dates to agree with formatMonthDay: SQLite's
+// "localtime" modifier is effectively UTC inside the sql.js WASM
+// build, so strftime cannot be trusted for month boundaries here.
+function monthlySpendingWindow() {
+    if (db === null) return null;
+
+    const statement = db.prepare(
+        `SELECT MAX("Timestamp") AS "__latest" FROM "Transaction" ` +
+            `WHERE "Timestamp" IS NOT NULL`
+    );
+    let latest = null;
+    try {
+        if (statement.step()) latest = statement.getAsObject()["__latest"];
+    } finally {
+        statement.free();
+    }
+    if (isBlank(latest)) return null;
+
+    const anchor = new Date(Number(latest));
+    if (Number.isNaN(anchor.getTime())) return null;
+
+    // The window opens on the first of the month eleven months before
+    // the anchor month.
+    const start = new Date(
+        anchor.getFullYear(),
+        anchor.getMonth() - (MONTHS_IN_WINDOW - 1),
+        1
+    );
+
+    const labels = [];
+    const buckets = [];
+    for (let i = 0; i < MONTHS_IN_WINDOW; i += 1) {
+        const month = new Date(start.getFullYear(), start.getMonth() + i, 1);
+        labels.push(
+            month.toLocaleDateString(undefined, {
+                month: "short",
+                year: "numeric",
+            })
+        );
+        buckets.push(month.getFullYear() * MONTHS_IN_WINDOW + month.getMonth());
+    }
+
+    return { labels, buckets, startMs: start.getTime(), start };
+}
+
+// Spending per month for the selected pocket: only outgoing amounts
+// count, so credits and refunds are ignored rather than netting a
+// month down, and every bar is positive.
+//
+// This is the one query that aggregates in JS instead of SQL. It reads
+// two columns for a single pocket over twelve months, and there is no
+// way to GROUP BY a *local* calendar month in this engine, so the
+// window is bucketed after the fetch rather than in the query.
+function queryMonthlySpending() {
+    const window = monthlySpendingWindow();
+    if (window === null || pocketState.pocket === null) return null;
+
+    const totals = window.buckets.map(() => 0);
+    const statement = db.prepare(
+        `SELECT "Timestamp", "Amount" FROM "Transaction" ` +
+            `WHERE "Pocket" = $pocket AND "Timestamp" IS NOT NULL ` +
+            `AND "Timestamp" >= $start`,
+        { $pocket: pocketState.pocket, $start: window.startMs }
+    );
+    try {
+        while (statement.step()) {
+            const row = statement.getAsObject();
+            const amount = Number(row.Amount);
+            if (Number.isNaN(amount) || amount >= 0) continue;
+
+            const date = new Date(Number(row.Timestamp));
+            if (Number.isNaN(date.getTime())) continue;
+
+            const index = window.buckets.indexOf(
+                date.getFullYear() * MONTHS_IN_WINDOW + date.getMonth()
+            );
+            // Anything older than the window (or past the anchor
+            // month) is not charted.
+            if (index === -1) continue;
+            totals[index] -= amount;
+        }
+    } finally {
+        statement.free();
+    }
+
+    return {
+        labels: window.labels,
+        totals,
+        first: window.labels[0],
+        last: window.labels[MONTHS_IN_WINDOW - 1],
+    };
+}
+
+// Chart.js needs concrete colour strings, but the palette lives in
+// Pico's CSS variables so the chart matches the active theme.
+function chartColor(name, fallback) {
+    const value = getComputedStyle(document.documentElement)
+        .getPropertyValue(name)
+        .trim();
+    return value === "" ? fallback : value;
+}
+
+// A Chart instance keeps the canvas (and its 2D context) alive, and
+// new Chart() on a canvas that already has one throws "Canvas is
+// already in use", so the instance is always torn down before the
+// canvas is reused or hidden.
+function destroyPocketChart() {
+    if (pocketChart !== null) pocketChart.destroy();
+    pocketChart = null;
+    pocketChartKey = null;
+}
+
+function hidePocketChart() {
+    pocketChartFigure.hidden = true;
+    destroyPocketChart();
+}
+
+// The chart is only rebuilt when the selected pocket changed: paging
+// re-renders the list but never alters the monthly totals.
+function renderPocketChart() {
+    if (!chartAvailable() || pocketState.pocket === null) {
+        hidePocketChart();
+        return;
+    }
+
+    const key = pocketState.pocket;
+    if (pocketChart !== null && pocketChartKey === key) return;
+
+    const spending = queryMonthlySpending();
+    if (spending === null) {
+        // No dated transaction anywhere: there is no timeline to draw.
+        hidePocketChart();
+        return;
+    }
+
+    const pocket = pocketState.pocket;
+    let peak = 0;
+    for (let i = 1; i < spending.totals.length; i += 1) {
+        if (spending.totals[i] > spending.totals[peak]) peak = i;
+    }
+
+    // A bar chart of nothing says less than a sentence does. The list
+    // below can still be showing this pocket's older transactions.
+    if (spending.totals[peak] <= 0) {
+        destroyPocketChart();
+        pocketChartWrap.hidden = true;
+        pocketChartFigure.hidden = false;
+        pocketChartCaption.textContent =
+            `${pocket} — no spending recorded in the last ` +
+            `${MONTHS_IN_WINDOW} months.`;
+        pocketChartCanvas.setAttribute(
+            "aria-label",
+            pocketChartCaption.textContent
+        );
+        return;
+    }
+
+    // Free the canvas before a new instance claims it.
+    destroyPocketChart();
+
+    pocketChartWrap.hidden = false;
+    pocketChartFigure.hidden = false;
+    pocketChartCaption.textContent =
+        `Spending by month — ${pocket} · ${spending.first} – ${spending.last}`;
+    // The canvas renders as an image, so it carries its own text
+    // alternative describing the shape of the data.
+    pocketChartCanvas.setAttribute(
+        "aria-label",
+        `Bar chart of total spending per month for ${pocket}, ` +
+            `${spending.first} to ${spending.last}. ` +
+            `Highest month: ${spending.labels[peak]} at ` +
+            `${formatCurrency(spending.totals[peak])}.`
+    );
+
+    pocketChart = new Chart(pocketChartCanvas, {
+        type: "bar",
+        data: {
+            labels: spending.labels,
+            datasets: [
+                {
+                    label: "Spending",
+                    data: spending.totals,
+                    backgroundColor: chartColor("--pico-primary", "#0172ad"),
+                    borderRadius: 4,
+                },
+            ],
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: (context) => formatCurrency(context.parsed.y),
+                    },
+                },
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    grid: {
+                        color: chartColor(
+                            "--pico-muted-border-color",
+                            "#e0e0e0"
+                        ),
+                    },
+                    ticks: { callback: (value) => formatCurrency(value) },
+                },
+                x: { grid: { display: false } },
+            },
+        },
+    });
+    pocketChartKey = key;
+}
 
 function showError(label, error) {
     console.error(`${label}:`, error);

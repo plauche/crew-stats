@@ -16,6 +16,10 @@
             defer
             src="https://cdn.jsdelivr.net/npm/sql.js@1.13.0/dist/sql-wasm.js"
         ></script>
+        <script
+            defer
+            src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"
+        ></script>
 
         <title>Crew Stats</title>
 
@@ -71,6 +75,18 @@
                 <select id="pocket-select"></select>
 
                 <p id="pocket-status" role="status"></p>
+
+                <figure id="pocket-chart-figure" hidden>
+                    <figcaption id="pocket-chart-caption"></figcaption>
+                    <div id="pocket-chart-wrap">
+                        <canvas
+                            id="pocket-chart"
+                            role="img"
+                            aria-label=""
+                        ></canvas>
+                    </div>
+                </figure>
+
                 <div id="pocket-container"></div>
             </section>
         </main>
