@@ -182,6 +182,10 @@ function normalizeRows(rows) {
 // Reserve". Note is only written here, never read, so importing the
 // same file again derives the same result.
 const AUTOPILOT_RESERVE_TITLE = "Autopilot Reserve";
+// Older exports spell the transfer title just "Autopilot", without
+// the "Reserve" suffix, so both filters below match this shorter
+// form; every title containing "Autopilot Reserve" contains it too.
+const AUTOPILOT_TITLE = "Autopilot";
 const REVIEW_POCKET = "Needs Attention";
 
 function repairPocketLabels(rows) {
@@ -189,14 +193,24 @@ function repairPocketLabels(rows) {
 
     const repaired = rows.map((row) => {
         const title = (row.Title || "").toLowerCase();
-        if (!title.includes(AUTOPILOT_RESERVE_TITLE.toLowerCase())) {
+        if (!title.includes(AUTOPILOT_TITLE.toLowerCase())) {
             return row;
         }
 
         const original = (row.Pocket || "").trim();
         const haystack =
             `${row.Title || ""}\n${row.Memo || ""}`.toLowerCase();
-        if (original !== "" && haystack.includes(original.toLowerCase())) {
+        // Exempt a row the Title (or Memo) already justifies, and a
+        // row already filed under the Autopilot Reserve pocket: the
+        // pairing pass runs first and puts the negative leg there,
+        // possibly with only "Autopilot" in the Title, and that leg
+        // must not be bounced to the review queue.
+        if (
+            original !== "" &&
+            (haystack.includes(original.toLowerCase()) ||
+                original.toLowerCase() ===
+                    AUTOPILOT_RESERVE_TITLE.toLowerCase())
+        ) {
             return row;
         }
 
@@ -213,6 +227,76 @@ function repairPocketLabels(rows) {
     });
 
     return { rows: repaired, reassigned };
+}
+
+// A mirrored pair of Autopilot transfers filed under the same
+// pocket on the same day is one movement recorded twice: the positive
+// leg belongs to that pocket, while the negative leg is the reserve
+// side and is filed under the Autopilot Reserve pocket instead. The
+// original pocket is kept in Note, the same way repairPocketLabels
+// records it. Both title spellings count, because one leg may read
+// "Autopilot" where the other reads "Autopilot Reserve".
+//
+// This runs before repairPocketLabels so the pairing is done on the
+// pockets as filed in the export, and so the moved leg's new pocket
+// ("Autopilot Reserve", which a "Autopilot Reserve" title mentions)
+// is left alone by the repair pass. Rows without a readable day or a
+// non-zero amount are never paired, and a group with no positive leg
+// is left untouched.
+function pairAutopilotReserveLegs(rows) {
+    const groups = new Map();
+
+    rows.forEach((row, index) => {
+        const title = (row.Title || "").toLowerCase();
+        if (!title.includes(AUTOPILOT_TITLE.toLowerCase())) {
+            return;
+        }
+
+        const amount = Number(row.Amount);
+        const ms = toEpochMs(row.Timestamp);
+        if (!Number.isFinite(amount) || amount === 0 || ms === null) {
+            return;
+        }
+
+        const date = new Date(ms);
+        const key = [
+            (row.Pocket || "").trim(),
+            date.getFullYear(),
+            date.getMonth(),
+            date.getDate(),
+            Math.abs(amount),
+        ].join("\u0000");
+
+        const group = groups.get(key);
+        if (group === undefined) {
+            groups.set(key, [index]);
+        } else {
+            group.push(index);
+        }
+    });
+
+    let moved = 0;
+    const paired = rows.slice();
+
+    for (const indexes of groups.values()) {
+        if (!indexes.some((i) => Number(paired[i].Amount) > 0)) continue;
+
+        for (const i of indexes) {
+            if (Number(paired[i].Amount) >= 0) continue;
+
+            const original = (paired[i].Pocket || "").trim();
+            const label = `was: ${original === "" ? "(blank)" : original}`;
+            const note = (paired[i].Note || "").trim();
+            paired[i] = {
+                ...paired[i],
+                Pocket: AUTOPILOT_RESERVE_TITLE,
+                Note: note === "" ? label : `${note} · ${label}`,
+            };
+            moved += 1;
+        }
+    }
+
+    return { rows: paired, moved };
 }
 
 
@@ -1171,10 +1255,14 @@ fileInput.addEventListener("change", function (event) {
                     toEpochMs(row.Timestamp) === null
             ).length;
 
-            // Repair the pocket labels before anything reads them: the
-            // table, the dropdown, the chart and the card all render
-            // the stored value.
-            const { rows, reassigned } = repairPocketLabels(fileRows);
+            // File mirrored Autopilot Reserve legs under the reserve
+            // pocket first (pairing uses the pockets as filed in the
+            // export), then repair whatever pocket labels remain,
+            // before anything reads them: the table, the dropdown, the
+            // chart and the card all render the stored value.
+            const { rows: pairedRows, moved } =
+                pairAutopilotReserveLegs(fileRows);
+            const { rows, reassigned } = repairPocketLabels(pairedRows);
 
             // A new file's headers may not match the old sort.
             sortState = { column: null, direction: "asc" };
@@ -1227,6 +1315,12 @@ fileInput.addEventListener("change", function (event) {
                         notes.push(
                             `${reassigned} transaction(s) moved to ` +
                                 REVIEW_POCKET
+                        );
+                    }
+                    if (moved > 0) {
+                        notes.push(
+                            `${moved} transaction(s) moved to ` +
+                                AUTOPILOT_RESERVE_TITLE
                         );
                     }
                     statusEl.textContent =
