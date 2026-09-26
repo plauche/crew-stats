@@ -14,6 +14,8 @@ const pocketChartFigure = document.getElementById("pocket-chart-figure");
 const pocketChartCaption = document.getElementById("pocket-chart-caption");
 const pocketChartWrap = document.getElementById("pocket-chart-wrap");
 const pocketChartCanvas = document.getElementById("pocket-chart");
+const pocketStats = document.getElementById("pocket-stats");
+const pocketStatsList = document.getElementById("pocket-stats-list");
 
 // Schema. "Transaction" is quoted because TRANSACTION is an SQLite
 // keyword. Timestamp is stored as epoch milliseconds so that
@@ -85,15 +87,21 @@ let currentPage = 1;
 // pointing past the end of the pocket's rows.
 let pocketState = { pocket: null, page: 1 };
 
-// The live Chart.js instance and the pocket it was built for, so
-// re-rendering the list while paging does not rebuild the chart.
-// destroyPocketChart() always resets both together.
+// The live Chart.js instance and the pocket the chart and statistics
+// were built for, so re-rendering the list while paging does not
+// rebuild either. destroyPocketChart() always resets the chart, and
+// hidePocketSummary() resets the key too.
 let pocketChart = null;
-let pocketChartKey = null;
+let pocketSummaryKey = null;
 
 // How many monthly buckets the chart shows, ending with the most
 // recent month recorded across all pockets.
 const MONTHS_IN_WINDOW = 12;
+
+// Averaging periods for the statistics, counted back from the end of
+// that same window (the most recent month), so they are always a tail
+// of the charted months.
+const SPENDING_PERIODS = [3, 6, 12];
 
 
 // CSV headers are matched to the schema case- and separator-
@@ -501,7 +509,7 @@ function selectTab(name) {
     if (name === "pockets") {
         renderPocket();
     } else {
-        hidePocketChart();
+        hidePocketSummary();
     }
 }
 
@@ -653,20 +661,20 @@ function renderPocket() {
 
     if (pocketSelect.disabled) {
         pocketStatus.textContent = "No pockets in this file.";
-        hidePocketChart();
+        hidePocketSummary();
         return;
     }
 
     if (pocketState.pocket === null) {
         pocketStatus.textContent = "Select a pocket to view its transactions.";
-        hidePocketChart();
+        hidePocketSummary();
         return;
     }
 
     const { rows, total } = queryPocketPage();
     if (total === 0) {
         pocketStatus.textContent = `No transactions in ${pocketState.pocket}.`;
-        hidePocketChart();
+        hidePocketSummary();
         return;
     }
 
@@ -733,9 +741,9 @@ function renderPocket() {
         if (target !== null) target.focus();
     }
 
-    // Drawn last, once the list this chart describes is in place. A
-    // paging re-render leaves the existing instance alone.
-    renderPocketChart();
+    // Rendered last, once the list they describe is in place. A paging
+    // re-render leaves the existing chart and statistics alone.
+    renderPocketSummary();
 }
 
 pocketSelect.addEventListener("change", () => {
@@ -865,44 +873,84 @@ function chartColor(name, fallback) {
 function destroyPocketChart() {
     if (pocketChart !== null) pocketChart.destroy();
     pocketChart = null;
-    pocketChartKey = null;
 }
 
-function hidePocketChart() {
+// Statistics mirror the chart's visibility, and are emptied when
+// hidden so no previous pocket's numbers are left sitting in the DOM.
+function hidePocketStats() {
+    pocketStats.hidden = true;
+    pocketStatsList.replaceChildren();
+}
+
+function hidePocketSummary() {
     pocketChartFigure.hidden = true;
+    hidePocketStats();
     destroyPocketChart();
+    pocketSummaryKey = null;
 }
 
-// The chart is only rebuilt when the selected pocket changed: paging
-// re-renders the list but never alters the monthly totals.
-function renderPocketChart() {
-    if (!chartAvailable() || pocketState.pocket === null) {
-        hidePocketChart();
+function hasSpending(spending) {
+    return spending.totals.some((total) => total > 0);
+}
+
+// Averages over the tail of the charted window: the last 3, 6 and 12
+// months, each divided by its own period, so a month with no spending
+// counts as a zero month rather than being skipped.
+function renderPocketStats(spending) {
+    pocketStatsList.replaceChildren();
+
+    for (const months of SPENDING_PERIODS) {
+        const recent = spending.totals.slice(-months);
+        const average =
+            recent.reduce((sum, total) => sum + total, 0) / months;
+
+        const stat = document.createElement("div");
+        stat.className = "stat";
+
+        const label = document.createElement("dt");
+        label.textContent = `Last ${months} months`;
+
+        const value = document.createElement("dd");
+        value.textContent = formatCurrency(average);
+
+        stat.appendChild(label);
+        stat.appendChild(value);
+        pocketStatsList.appendChild(stat);
+    }
+
+    pocketStats.hidden = false;
+}
+
+// The chart and the statistics are two views of one query and share a
+// lifecycle, so they are rendered together. Both are rebuilt only when
+// the selected pocket changed: paging re-renders the list but never
+// alters the monthly totals.
+function renderPocketSummary() {
+    if (pocketState.pocket === null) {
+        hidePocketSummary();
         return;
     }
 
     const key = pocketState.pocket;
-    if (pocketChart !== null && pocketChartKey === key) return;
+    if (key === pocketSummaryKey) return;
 
     const spending = queryMonthlySpending();
     if (spending === null) {
         // No dated transaction anywhere: there is no timeline to draw.
-        hidePocketChart();
+        hidePocketSummary();
         return;
     }
 
     const pocket = pocketState.pocket;
-    let peak = 0;
-    for (let i = 1; i < spending.totals.length; i += 1) {
-        if (spending.totals[i] > spending.totals[peak]) peak = i;
-    }
 
-    // A bar chart of nothing says less than a sentence does. The list
-    // below can still be showing this pocket's older transactions.
-    if (spending.totals[peak] <= 0) {
+    // A bar chart of nothing says less than a sentence does, and an
+    // average over zero months helps nobody. The list below can still
+    // be showing this pocket's older transactions.
+    if (!hasSpending(spending)) {
         destroyPocketChart();
         pocketChartWrap.hidden = true;
         pocketChartFigure.hidden = false;
+        hidePocketStats();
         pocketChartCaption.textContent =
             `${pocket} — no spending recorded in the last ` +
             `${MONTHS_IN_WINDOW} months.`;
@@ -910,7 +958,27 @@ function renderPocketChart() {
             "aria-label",
             pocketChartCaption.textContent
         );
+        pocketSummaryKey = key;
         return;
+    }
+
+    drawPocketChart(spending, pocket);
+    renderPocketStats(spending);
+    pocketSummaryKey = key;
+}
+
+function drawPocketChart(spending, pocket) {
+    // With Chart.js unavailable (a blocked CDN) there is nothing to
+    // draw, but the statistics below stand on their own.
+    if (!chartAvailable()) {
+        pocketChartFigure.hidden = true;
+        destroyPocketChart();
+        return;
+    }
+
+    let peak = 0;
+    for (let i = 1; i < spending.totals.length; i += 1) {
+        if (spending.totals[i] > spending.totals[peak]) peak = i;
     }
 
     // Free the canvas before a new instance claims it.
@@ -969,7 +1037,6 @@ function renderPocketChart() {
             },
         },
     });
-    pocketChartKey = key;
 }
 
 function showError(label, error) {
