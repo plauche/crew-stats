@@ -27,7 +27,52 @@
             <input type="file" id="csv-file-input" accept=".csv,text/csv" />
 
             <p id="status" role="status"></p>
-            <div id="table-container"></div>
+
+            <div role="tablist" aria-label="Views">
+                <button
+                    type="button"
+                    role="tab"
+                    id="tab-transactions"
+                    aria-controls="panel-transactions"
+                    aria-selected="true"
+                    tabindex="0"
+                >
+                    Transactions
+                </button>
+                <button
+                    type="button"
+                    role="tab"
+                    id="tab-pockets"
+                    aria-controls="panel-pockets"
+                    aria-selected="false"
+                    tabindex="-1"
+                >
+                    Pockets
+                </button>
+            </div>
+
+            <section
+                role="tabpanel"
+                id="panel-transactions"
+                aria-labelledby="tab-transactions"
+                tabindex="0"
+            >
+                <div id="table-container"></div>
+            </section>
+
+            <section
+                role="tabpanel"
+                id="panel-pockets"
+                aria-labelledby="tab-pockets"
+                tabindex="0"
+                hidden
+            >
+                <label for="pocket-select">Pocket</label>
+                <select id="pocket-select"></select>
+
+                <p id="pocket-status" role="status"></p>
+                <div id="pocket-container"></div>
+            </section>
         </main>
 
         <dialog id="transaction-card" aria-labelledby="transaction-card-title">

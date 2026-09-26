@@ -5,6 +5,11 @@ const cardDialog = document.getElementById("transaction-card");
 const cardTitle = document.getElementById("transaction-card-title");
 const cardFields = document.getElementById("transaction-card-fields");
 const cardClose = document.getElementById("transaction-card-close");
+const tabButtons = [...document.querySelectorAll('[role="tab"]')];
+const tabPanels = [...document.querySelectorAll('[role="tabpanel"]')];
+const pocketSelect = document.getElementById("pocket-select");
+const pocketStatus = document.getElementById("pocket-status");
+const pocketContainer = document.getElementById("pocket-container");
 
 // Schema. "Transaction" is quoted because TRANSACTION is an SQLite
 // keyword. Timestamp is stored as epoch milliseconds so that
@@ -55,12 +60,26 @@ const DISPLAY_COLUMNS = [
     { label: "Amount", column: "Amount" },
 ];
 
+// Columns shown in the Pockets tab, in display order. Same shape as
+// DISPLAY_COLUMNS so more fields can be added here alone; this view
+// is not sortable, so the column names are only used for lookup.
+const POCKET_COLUMNS = [
+    { label: "Date", column: "Timestamp" },
+    { label: "Title", column: "Title" },
+    { label: "Amount", column: "Amount" },
+];
+
 // Paging happens in SQL (LIMIT/OFFSET) rather than in JS, so only
 // the visible page of rows is ever materialised. Every path that
 // shrinks the table (a new import) or re-orders it (a new sort) also
 // resets this to 1, so it is never left pointing past the end.
 const PAGE_SIZE = 10;
 let currentPage = 1;
+
+// Pockets tab state. The page is reset whenever the selected pocket
+// changes or a new file is imported, so it is likewise never left
+// pointing past the end of the pocket's rows.
+let pocketState = { pocket: null, page: 1 };
 
 
 // CSV headers are matched to the schema case- and separator-
@@ -299,7 +318,9 @@ function goToPage(page) {
     renderTable();
 }
 
-function createPagination(page, pageCount, total) {
+// Shared by both tabs: the callbacks decide which view re-renders,
+// and keyPrefix keeps the focus-restore keys unique between them.
+function createPagination(page, pageCount, total, { keyPrefix, onPrev, onNext }) {
     const nav = document.createElement("nav");
     nav.className = "pagination";
     nav.setAttribute("aria-label", "Pagination");
@@ -316,18 +337,18 @@ function createPagination(page, pageCount, total) {
     const prev = document.createElement("button");
     prev.type = "button";
     prev.className = "page-button";
-    prev.dataset.focusKey = "page:prev";
+    prev.dataset.focusKey = `${keyPrefix}:prev`;
     prev.textContent = "Previous";
     prev.disabled = page <= 1;
-    prev.addEventListener("click", () => goToPage(page - 1));
+    prev.addEventListener("click", onPrev);
 
     const next = document.createElement("button");
     next.type = "button";
     next.className = "page-button";
-    next.dataset.focusKey = "page:next";
+    next.dataset.focusKey = `${keyPrefix}:next`;
     next.textContent = "Next";
     next.disabled = page >= pageCount;
-    next.addEventListener("click", () => goToPage(page + 1));
+    next.addEventListener("click", onNext);
 
     const label = document.createElement("span");
     label.className = "pagination-label";
@@ -428,7 +449,11 @@ function renderTable() {
     // Only worth showing when the rows do not all fit on one page.
     if (pageCount > 1) {
         tableContainer.appendChild(
-            createPagination(currentPage, pageCount, total)
+            createPagination(currentPage, pageCount, total, {
+                keyPrefix: "page",
+                onPrev: () => goToPage(currentPage - 1),
+                onNext: () => goToPage(currentPage + 1),
+            })
         );
     }
 
@@ -439,6 +464,259 @@ function renderTable() {
         if (target !== null) target.focus();
     }
 }
+
+/* ------------------------------ Tabs ------------------------------ */
+
+// Roving-tabindex tab switching: exactly one tab is selected, and its
+// panel is the only one visible. Panel ids are derived from tab ids,
+// so "panel-transactions" pairs with "tab-transactions".
+function selectTab(name) {
+    for (const button of tabButtons) {
+        const selected = button.id === `tab-${name}`;
+        button.setAttribute("aria-selected", selected ? "true" : "false");
+        button.tabIndex = selected ? 0 : -1;
+    }
+    for (const panel of tabPanels) {
+        panel.hidden = panel.id !== `panel-${name}`;
+    }
+
+    // The Pockets panel is re-rendered on entry so it can never show
+    // rows that a newer import has since replaced.
+    if (name === "pockets") renderPocket();
+}
+
+function tabName(button) {
+    return button.id.replace(/^tab-/, "");
+}
+
+for (const button of tabButtons) {
+    button.addEventListener("click", () => selectTab(tabName(button)));
+
+    // Arrow keys move between tabs and select as they go, which is
+    // what the ARIA tabs pattern expects.
+    button.addEventListener("keydown", (event) => {
+        const index = tabButtons.indexOf(button);
+        let target = null;
+        if (event.key === "ArrowRight") {
+            target = tabButtons[(index + 1) % tabButtons.length];
+        } else if (event.key === "ArrowLeft") {
+            target =
+                tabButtons[(index - 1 + tabButtons.length) % tabButtons.length];
+        } else if (event.key === "Home") {
+            target = tabButtons[0];
+        } else if (event.key === "End") {
+            target = tabButtons[tabButtons.length - 1];
+        }
+        if (target === null) return;
+        event.preventDefault();
+        target.focus();
+        selectTab(tabName(target));
+    });
+}
+
+/* ----------------------------- Pockets ---------------------------- */
+
+const POCKET_PLACEHOLDER = "Select a pocket…";
+
+// Distinct, non-blank pocket names in alphabetical order. DISTINCT
+// compares the stored values exactly; only the ordering is
+// case-insensitive. A blank Pocket is not a name, so it is excluded.
+function queryPocketNames() {
+    const statement = db.prepare(
+        `SELECT DISTINCT "Pocket" FROM "Transaction" ` +
+            `WHERE "Pocket" IS NOT NULL AND TRIM("Pocket") <> '' ` +
+            `ORDER BY "Pocket" COLLATE NOCASE ASC`
+    );
+    const names = [];
+    try {
+        while (statement.step()) names.push(statement.getAsObject().Pocket);
+    } finally {
+        statement.free();
+    }
+    return names;
+}
+
+// Rebuilds the dropdown from the current data, keeping the selection
+// only when that pocket still exists. Callers that must drop the
+// selection (an import) clear pocketState first.
+function populatePocketOptions() {
+    const names = db === null ? [] : queryPocketNames();
+
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = POCKET_PLACEHOLDER;
+
+    const options = [placeholder];
+    for (const name of names) {
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent = name;
+        options.push(option);
+    }
+    pocketSelect.replaceChildren(...options);
+    pocketSelect.disabled = names.length === 0;
+
+    const keep = pocketState.pocket;
+    if (keep !== null && names.includes(keep)) {
+        pocketSelect.value = keep;
+    } else {
+        pocketSelect.value = "";
+        pocketState = { pocket: null, page: 1 };
+        pocketContainer.replaceChildren();
+    }
+}
+
+// A new import invalidates the whole tab: the list of pockets can
+// change entirely, so any previous selection is dropped.
+function resetPocketView() {
+    pocketState = { pocket: null, page: 1 };
+    pocketContainer.replaceChildren();
+    populatePocketOptions();
+    // Sets the appropriate instruction / empty-state message.
+    renderPocket();
+}
+
+// The visible page of one pocket's transactions, newest first. Every
+// column is selected (not just the displayed three) so a row click
+// can open the same detail card as the Transactions tab. Timestamp
+// is epoch milliseconds, so DESC is a true chronological order, and
+// rowid breaks ties between equal timestamps.
+function queryPocketPage() {
+    if (db === null || pocketState.pocket === null) {
+        return { rows: [], total: 0 };
+    }
+
+    // Named parameters only: sql.js cannot mix "?" placeholders
+    // with a named-parameter object ("datatype mismatch").
+    const statement = db.prepare(
+        `SELECT ${COLUMN_LIST}, COUNT(*) OVER () AS "__total" ` +
+            `FROM "Transaction" WHERE "Pocket" = $pocket ` +
+            `ORDER BY "Timestamp" DESC NULLS LAST, rowid DESC ` +
+            `LIMIT $limit OFFSET $offset`,
+        {
+            $pocket: pocketState.pocket,
+            $limit: PAGE_SIZE,
+            $offset: (pocketState.page - 1) * PAGE_SIZE,
+        }
+    );
+    const rows = [];
+    try {
+        while (statement.step()) rows.push(statement.getAsObject());
+    } finally {
+        statement.free();
+    }
+    const total = rows.length > 0 ? Number(rows[0]["__total"]) : 0;
+    return { rows, total };
+}
+
+function goToPocketPage(page) {
+    pocketState = { pocket: pocketState.pocket, page };
+    renderPocket();
+}
+
+// The single place that keeps the dropdown, the status line and the
+// pocket table in step. It re-runs on tab entry, on selection change
+// and on paging.
+function renderPocket() {
+    if (db === null) return;
+
+    // Re-rendering destroys the focused control, so remember its
+    // data-focus-key in order to restore focus afterwards.
+    const active = document.activeElement;
+    const focusedKey =
+        active && active.dataset ? active.dataset.focusKey || null : null;
+
+    if (pocketSelect.options.length === 0) populatePocketOptions();
+
+    pocketContainer.replaceChildren();
+    pocketContainer.className = "overflow-auto";
+
+    if (pocketSelect.disabled) {
+        pocketStatus.textContent = "No pockets in this file.";
+        return;
+    }
+
+    if (pocketState.pocket === null) {
+        pocketStatus.textContent = "Select a pocket to view its transactions.";
+        return;
+    }
+
+    const { rows, total } = queryPocketPage();
+    if (total === 0) {
+        pocketStatus.textContent = `No transactions in ${pocketState.pocket}.`;
+        return;
+    }
+
+    pocketStatus.textContent = "";
+
+    const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+    const table = document.createElement("table");
+    table.className = "striped";
+
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    for (const display of POCKET_COLUMNS) {
+        const th = document.createElement("th");
+        th.setAttribute("scope", "col");
+        th.textContent = display.label;
+        headRow.appendChild(th);
+    }
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    const tbody = document.createElement("tbody");
+    for (const row of rows) {
+        const tr = document.createElement("tr");
+        for (const display of POCKET_COLUMNS) {
+            const td = document.createElement("td");
+            const value = row[display.column];
+            td.textContent =
+                display.column === "Timestamp"
+                    ? formatMonthDay(value)
+                    : formatCell(display.column, value);
+            tr.appendChild(td);
+        }
+        // Same interaction as the Transactions table: the row is the
+        // click target and opens the detail card, and the closure
+        // carries the full row so no lookup table is needed.
+        tr.addEventListener("click", () => openCard(row));
+        tr.tabIndex = 0;
+        tr.setAttribute("aria-haspopup", "dialog");
+        tr.addEventListener("keydown", (event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
+            openCard(row);
+        });
+        tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    pocketContainer.appendChild(table);
+
+    // Only worth showing when the rows do not all fit on one page.
+    if (pageCount > 1) {
+        pocketContainer.appendChild(
+            createPagination(pocketState.page, pageCount, total, {
+                keyPrefix: "pocket-page",
+                onPrev: () => goToPocketPage(pocketState.page - 1),
+                onNext: () => goToPocketPage(pocketState.page + 1),
+            })
+        );
+    }
+
+    if (focusedKey !== null) {
+        const target = pocketContainer.querySelector(
+            `[data-focus-key="${focusedKey}"]`
+        );
+        if (target !== null) target.focus();
+    }
+}
+
+pocketSelect.addEventListener("change", () => {
+    const value = pocketSelect.value;
+    // A changed pocket always starts back at its first page.
+    pocketState = { pocket: value === "" ? null : value, page: 1 };
+    renderPocket();
+});
 
 function showError(label, error) {
     console.error(`${label}:`, error);
@@ -531,6 +809,14 @@ fileInput.addEventListener("change", function (event) {
                 // finished loading.
                 await dbReady;
                 loadRows(rows);
+
+                // A new file replaces every row, so the pocket list
+                // and any selection from the previous import go too.
+                resetPocketView();
+
+                // Transactions is the default view after an upload,
+                // even if the Pockets tab was open beforehand.
+                selectTab("transactions");
                 renderTable();
 
                 if (rows.length > 0) {

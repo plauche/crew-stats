@@ -116,3 +116,58 @@ table.striped tbody tr:focus-visible {
         gap: 0.15rem;
     }
 }
+
+/* Tabbed views: a flat row of buttons sharing one baseline rule.
+   Pico v2 ships no tab component, so this is the whole widget. */
+[role="tablist"] {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    margin-bottom: 1rem;
+    border-bottom: 1px solid var(--pico-muted-border-color);
+}
+
+[role="tab"] {
+    margin: 0;
+    padding: 0.5rem 0.875rem;
+    background: none;
+    border: none;
+    /* Sit on top of the tablist rule, so the selected underline
+       replaces it rather than stacking under it. */
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    color: var(--pico-muted-color);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+[role="tab"][aria-selected="true"] {
+    color: var(--pico-primary);
+    border-bottom-color: var(--pico-primary);
+}
+
+@media (hover: hover) and (pointer: fine) {
+    [role="tab"]:hover {
+        color: var(--pico-primary);
+    }
+}
+
+[role="tab"]:focus-visible {
+    outline: 2px solid var(--pico-primary);
+    outline-offset: -2px;
+}
+
+/* The hidden attribute alone would be enough, but stating it keeps
+   the panels hidden regardless of what a future Pico release sets. */
+[role="tabpanel"][hidden] {
+    display: none;
+}
+
+/* Pocket picker: a dropdown this wide reads better than a
+   full-width control, and Pico sizes selects to their container. */
+#pocket-select {
+    max-width: 24rem;
+    margin-bottom: 0.75rem;
+}
+
